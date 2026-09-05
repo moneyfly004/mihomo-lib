@@ -1,0 +1,112 @@
+name: Build & Release libmihomo.aar
+
+# MoneyFly Android 内核发布仓库：
+# 把官方 MetaCubeX/mihomo（无 fork）用 gomobile bind 编译成 libmihomo.aar，
+# 发布到 GitHub Releases；MoneyFly 主仓库构建 APK 时直接下载该 aar（秒级），
+# 不在主仓库每次现编内核（省 10~20 分钟/次）。
+#
+# 触发：
+#   1) workflow_dispatch：手动指定版本（如 1.19.30；留空 = 官方最新稳定版）
+#   2) schedule（每天 UTC 03:00）：自动检测官方新稳定版并发布
+#   3) push tag v*：直接按 tag 版本发布
+# 幂等：某版本 release 已存在则跳过编译（不会重复发布）。
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'mihomo 内核版本（如 1.19.30；留空 = 官方最新稳定版）'
+        required: false
+        default: ''
+  schedule:
+    - cron: '0 3 * * *'
+  push:
+    tags:
+      - 'v*'
+
+env:
+  GO_VERSION: '1.26.6' # 与官方构建工具链一致
+  REPO: 'moneyfly004/mihomo-lib'
+
+jobs:
+  detect:
+    name: 探测目标版本
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      skip: ${{ steps.v.outputs.skip }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: |
+          VERSION="${{ github.event.inputs.version }}"
+          # push tag 时取 tag 版本
+          if [ -z "$VERSION" ] && [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            VERSION="${{ github.ref_name }}"
+            VERSION="${VERSION#v}"
+          fi
+          # 未指定 → 官方最新稳定版
+          if [ -z "$VERSION" ]; then
+            VERSION="$(curl -s https://api.github.com/repos/MetaCubeX/mihomo/releases/latest \
+              | python3 -c "import json,sys;print(json.load(sys.stdin)['tag_name'].lstrip('v'))")"
+          fi
+          echo "目标版本: v$VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          # 幂等：该版本已发布则跳过
+          if gh release view "v$VERSION" --repo "${{ env.REPO }}" >/dev/null 2>&1; then
+            echo "release v$VERSION 已存在，跳过"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  build:
+    name: 编译并发布 libmihomo.aar v${{ needs.detect.outputs.version }}
+    needs: detect
+    if: needs.detect.outputs.skip == 'false' && needs.detect.outputs.version != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: go.sum
+
+      - name: 安装 Android NDK（gomobile 编译需要）
+        run: |
+          echo "y" | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            --install "ndk;27.2.12479018" > /dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+
+      - name: 编译 libmihomo.aar（官方 mihomo v${{ needs.detect.outputs.version }}，gomobile bind）
+        run: |
+          go mod download
+          go get github.com/metacubex/mihomo@v${{ needs.detect.outputs.version }}
+          go mod tidy
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          gomobile init
+          gomobile bind \
+            -target=android \
+            -androidapi 21 \
+            -tags with_gvisor \
+            -javapkg top.moneyfly \
+            -o libmihomo.aar .
+          ls -lh libmihomo.aar
+          sha256sum libmihomo.aar > libmihomo.aar.sha256sum
+
+      - name: 发布 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ needs.detect.outputs.version }}"
+          gh release create "v$VERSION" \
+            --repo "${{ env.REPO }}" \
+            --title "libmihomo v$VERSION (mihomo $VERSION)" \
+            --notes "MoneyFly Android 内核库（官方 MetaCubeX/mihomo v$VERSION，gomobile bind，无 fork）。Java 包：top.moneyfly.mihomelib.Mihomelib" \
+            libmihomo.aar libmihomo.aar.sha256sum
