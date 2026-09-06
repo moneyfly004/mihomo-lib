@@ -10,6 +10,7 @@
 package mihomelib
 
 import (
+	"path/filepath"
 	"strings"
 	"fmt"
 	"sync"
@@ -53,6 +54,12 @@ func startLogCapture() {
 			}
 		}()
 	})
+}
+
+// 包加载即开始采集：mihomo log 包 init 先于本包执行（依赖先初始化），
+// 保证内核启动日志不丢失。
+func init() {
+	startLogCapture()
 }
 
 // Logs 返回自上次调用以来的新增内核日志（首次调用返回已采集的全部历史）。
@@ -112,6 +119,11 @@ func Start(homeDirArg string, configBytes []byte, tunFd int32) (err error) {
 
 	// 初始化 homeDir（config.Init 会建目录与默认文件）
 	C.SetHomeDir(homeDirArg)
+	// 关键：configFile 默认是相对路径 "config.yaml"，官方 main.go 会先
+	// SetConfig 绝对路径；库模式不设置的话 config.Init 会在进程工作目录
+	// （Android 上为 "/"，只读）尝试创建文件 → "read-only file system"。
+	// 显式指向 homeDir，保证 config.Init 的初始文件落到可写目录。
+	C.SetConfig(filepath.Join(homeDirArg, "config.yaml"))
 	if err := config.Init(C.Path.HomeDir()); err != nil {
 		return fmt.Errorf("init config dir: %w", err)
 	}
